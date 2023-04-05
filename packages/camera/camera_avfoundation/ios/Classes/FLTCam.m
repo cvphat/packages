@@ -519,14 +519,16 @@ NSString *const errorMethod = @"error";
           _videoTimeOffset = CMTimeAdd(_videoTimeOffset, offset);
         }
 
-        return;
+        // return;
+      }
+      else {
+        _lastVideoSampleTime = currentSampleTime;
+
+        CVPixelBufferRef nextBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        CMTime nextSampleTime = CMTimeSubtract(_lastVideoSampleTime, _videoTimeOffset);
+        [_videoAdaptor appendPixelBuffer:nextBuffer withPresentationTime:nextSampleTime];
       }
 
-      _lastVideoSampleTime = currentSampleTime;
-
-      CVPixelBufferRef nextBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-      CMTime nextSampleTime = CMTimeSubtract(_lastVideoSampleTime, _videoTimeOffset);
-      [_videoAdaptor appendPixelBuffer:nextBuffer withPresentationTime:nextSampleTime];
     } else {
       CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
 
@@ -544,17 +546,19 @@ NSString *const errorMethod = @"error";
           _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
         }
 
-        return;
+        // return;
       }
+      else {
+        _lastAudioSampleTime = currentSampleTime;
 
-      _lastAudioSampleTime = currentSampleTime;
+        if (_audioTimeOffset.value != 0) {
+          CFRelease(sampleBuffer);
+          sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
+        }
 
-      if (_audioTimeOffset.value != 0) {
-        CFRelease(sampleBuffer);
-        sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
+        [self newAudioSample:sampleBuffer];
       }
-
-      [self newAudioSample:sampleBuffer];
+      
     }
 
     CFRelease(sampleBuffer);
@@ -708,8 +712,8 @@ NSString *const errorMethod = @"error";
 
 - (void)pauseVideoRecordingWithResult:(FLTThreadSafeFlutterResult *)result {
   _isRecordingPaused = YES;
-  // _videoIsDisconnected = YES;
-  // _audioIsDisconnected = YES;
+  _videoIsDisconnected = YES;
+  _audioIsDisconnected = YES;
   [result sendSuccess];
 }
 
