@@ -708,8 +708,8 @@ NSString *const errorMethod = @"error";
 
 - (void)pauseVideoRecordingWithResult:(FLTThreadSafeFlutterResult *)result {
   _isRecordingPaused = YES;
-  _videoIsDisconnected = YES;
-  _audioIsDisconnected = YES;
+  // _videoIsDisconnected = YES;
+  // _audioIsDisconnected = YES;
   [result sendSuccess];
 }
 
