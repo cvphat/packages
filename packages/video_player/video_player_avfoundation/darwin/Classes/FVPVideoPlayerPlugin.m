@@ -9,6 +9,7 @@
 #import <GLKit/GLKit.h>
 
 #import "AVAssetTrackUtils.h"
+#import "FVPDisplayLink.h"
 #import "messages.g.h"
 
 #if !__has_feature(objc_arc)
@@ -20,9 +21,8 @@
 @property(nonatomic, weak, readonly) NSObject<FlutterTextureRegistry> *registry;
 // The output that this updater is managing.
 @property(nonatomic, weak) AVPlayerItemVideoOutput *videoOutput;
-#if TARGET_OS_IOS
-- (void)onDisplayLink:(CADisplayLink *)link;
-#endif
+// The last time that has been validated as avaliable according to hasNewPixelBufferForItemTime:.
+@property(nonatomic, assign) CMTime lastKnownAvailableTime;
 @end
 
 @implementation FVPFrameUpdater
@@ -30,56 +30,49 @@
   NSAssert(self, @"super init cannot be nil");
   if (self == nil) return nil;
   _registry = registry;
+  _lastKnownAvailableTime = kCMTimeInvalid;
   return self;
 }
-
-#if TARGET_OS_IOS
-- (void)onDisplayLink:(CADisplayLink *)link {
-  // TODO(stuartmorgan): Investigate switching this to displayLinkFired; iOS may also benefit from
-  // the availability check there.
-  [_registry textureFrameAvailable:_textureId];
-}
-#endif
 
 - (void)displayLinkFired {
   // Only report a new frame if one is actually available.
   CMTime outputItemTime = [self.videoOutput itemTimeForHostTime:CACurrentMediaTime()];
   if ([self.videoOutput hasNewPixelBufferForItemTime:outputItemTime]) {
+    _lastKnownAvailableTime = outputItemTime;
     [_registry textureFrameAvailable:_textureId];
   }
 }
 @end
 
-#if TARGET_OS_OSX
-static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp *now,
-                                    const CVTimeStamp *outputTime, CVOptionFlags flagsIn,
-                                    CVOptionFlags *flagsOut, void *displayLinkSource) {
-  // Trigger the main-thread dispatch queue, to drive a frame update check.
-  __weak dispatch_source_t source = (__bridge dispatch_source_t)displayLinkSource;
-  dispatch_source_merge_data(source, 1);
-  return kCVReturnSuccess;
-}
-#endif
-
-@interface FVPDefaultPlayerFactory : NSObject <FVPPlayerFactory>
+@interface FVPDefaultAVFactory : NSObject <FVPAVFactory>
 @end
 
-@implementation FVPDefaultPlayerFactory
+@implementation FVPDefaultAVFactory
 - (AVPlayer *)playerWithPlayerItem:(AVPlayerItem *)playerItem {
   return [AVPlayer playerWithPlayerItem:playerItem];
 }
+- (AVPlayerItemVideoOutput *)videoOutputWithPixelBufferAttributes:
+    (NSDictionary<NSString *, id> *)attributes {
+  return [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:attributes];
+}
+@end
+
+/// Non-test implementation of the diplay link factory.
+@interface FVPDefaultDisplayLinkFactory : NSObject <FVPDisplayLinkFactory>
+@end
+
+@implementation FVPDefaultDisplayLinkFactory
+- (FVPDisplayLink *)displayLinkWithRegistrar:(id<FlutterPluginRegistrar>)registrar
+                                    callback:(void (^)(void))callback {
+  return [[FVPDisplayLink alloc] initWithRegistrar:registrar callback:callback];
+}
 
 @end
 
-@interface FVPVideoPlayer : NSObject <FlutterTexture, FlutterStreamHandler>
-@property(readonly, nonatomic) AVPlayer *player;
+#pragma mark -
+
+@interface FVPVideoPlayer ()
 @property(readonly, nonatomic) AVPlayerItemVideoOutput *videoOutput;
-// This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
-// (https://github.com/flutter/flutter/issues/111457) and 2. swapped width and height for some video
-// streams (not just iOS 16).  (https://github.com/flutter/flutter/issues/109116).
-// An invisible AVPlayerLayer is used to overwrite the protection of pixel buffers in those streams
-// for issue #1, and restore the correct width and height for issue #2.
-@property(readonly, nonatomic) AVPlayerLayer *playerLayer;
 // The plugin registrar, to obtain view information from.
 @property(nonatomic, weak) NSObject<FlutterPluginRegistrar> *registrar;
 // The CALayer associated with the Flutter view this plugin is associated with, if any.
@@ -91,22 +84,25 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
 @property(nonatomic, readonly) BOOL isPlaying;
 @property(nonatomic) BOOL isLooping;
 @property(nonatomic, readonly) BOOL isInitialized;
-// TODO(stuartmorgan): Extract and abstract the display link to remove all the display-link-related
-// ifdefs from this file.
-#if TARGET_OS_OSX
-// The display link to trigger frame reads from the video player.
-@property(nonatomic, assign) CVDisplayLinkRef displayLink;
-// A dispatch source to move display link callbacks to the main thread.
-@property(nonatomic, strong) dispatch_source_t displayLinkSource;
-#else
-@property(nonatomic) CADisplayLink *displayLink;
-#endif
+// The updater that drives callbacks to the engine to indicate that a new frame is ready.
+@property(nonatomic) FVPFrameUpdater *frameUpdater;
+// The display link that drives frameUpdater.
+@property(nonatomic) FVPDisplayLink *displayLink;
+// Whether a new frame needs to be provided to the engine regardless of the current play/pause state
+// (e.g., after a seek while paused). If YES, the display link should continue to run until the next
+// frame is successfully provided.
+@property(nonatomic, assign) BOOL waitingForFrame;
 
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FVPFrameUpdater *)frameUpdater
+                displayLink:(FVPDisplayLink *)displayLink
                 httpHeaders:(nonnull NSDictionary<NSString *, NSString *> *)headers
-              playerFactory:(id<FVPPlayerFactory>)playerFactory
+                  avFactory:(id<FVPAVFactory>)avFactory
                   registrar:(NSObject<FlutterPluginRegistrar> *)registrar;
+
+// Tells the player to run its frame updater until it receives a frame, regardless of the
+// play/pause state.
+- (void)expectFrame;
 @end
 
 static void *timeRangeContext = &timeRangeContext;
@@ -119,7 +115,8 @@ static void *rateContext = &rateContext;
 @implementation FVPVideoPlayer
 - (instancetype)initWithAsset:(NSString *)asset
                  frameUpdater:(FVPFrameUpdater *)frameUpdater
-                playerFactory:(id<FVPPlayerFactory>)playerFactory
+                  displayLink:(FVPDisplayLink *)displayLink
+                    avFactory:(id<FVPAVFactory>)avFactory
                     registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   NSString *path = [[NSBundle mainBundle] pathForResource:asset ofType:nil];
 #if TARGET_OS_OSX
@@ -131,8 +128,9 @@ static void *rateContext = &rateContext;
 #endif
   return [self initWithURL:[NSURL fileURLWithPath:path]
               frameUpdater:frameUpdater
+               displayLink:displayLink
                httpHeaders:@{}
-             playerFactory:playerFactory
+                 avFactory:avFactory
                  registrar:registrar];
 }
 
@@ -243,40 +241,11 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   return videoComposition;
 }
 
-- (void)createVideoOutputAndDisplayLink:(FVPFrameUpdater *)frameUpdater {
-  NSDictionary *pixBuffAttributes = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
-  };
-  _videoOutput = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixBuffAttributes];
-
-#if TARGET_OS_OSX
-  frameUpdater.videoOutput = _videoOutput;
-  // Create and start the main-thread dispatch queue to drive frameUpdater.
-  self.displayLinkSource =
-      dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, dispatch_get_main_queue());
-  dispatch_source_set_event_handler(self.displayLinkSource, ^() {
-    @autoreleasepool {
-      [frameUpdater displayLinkFired];
-    }
-  });
-  dispatch_resume(self.displayLinkSource);
-  if (CVDisplayLinkCreateWithActiveCGDisplays(&_displayLink) == kCVReturnSuccess) {
-    CVDisplayLinkSetOutputCallback(_displayLink, &DisplayLinkCallback,
-                                   (__bridge void *)(self.displayLinkSource));
-  }
-#else
-  _displayLink = [CADisplayLink displayLinkWithTarget:frameUpdater
-                                             selector:@selector(onDisplayLink:)];
-  [_displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
-  _displayLink.paused = YES;
-#endif
-}
-
 - (instancetype)initWithURL:(NSURL *)url
                frameUpdater:(FVPFrameUpdater *)frameUpdater
+                displayLink:(FVPDisplayLink *)displayLink
                 httpHeaders:(nonnull NSDictionary<NSString *, NSString *> *)headers
-              playerFactory:(id<FVPPlayerFactory>)playerFactory
+                  avFactory:(id<FVPAVFactory>)avFactory
                   registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   NSDictionary<NSString *, id> *options = nil;
   if ([headers count] != 0) {
@@ -286,18 +255,21 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:urlAsset];
   return [self initWithPlayerItem:item
                      frameUpdater:frameUpdater
-                    playerFactory:playerFactory
+                      displayLink:(FVPDisplayLink *)displayLink
+                        avFactory:avFactory
                         registrar:registrar];
 }
 
 - (instancetype)initWithPlayerItem:(AVPlayerItem *)item
                       frameUpdater:(FVPFrameUpdater *)frameUpdater
-                     playerFactory:(id<FVPPlayerFactory>)playerFactory
+                       displayLink:(FVPDisplayLink *)displayLink
+                         avFactory:(id<FVPAVFactory>)avFactory
                          registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   self = [super init];
   NSAssert(self, @"super init cannot be nil");
 
   _registrar = registrar;
+  _frameUpdater = frameUpdater;
 
   AVAsset *asset = [item asset];
   void (^assetCompletionHandler)(void) = ^{
@@ -328,7 +300,7 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
     }
   };
 
-  _player = [playerFactory playerWithPlayerItem:item];
+  _player = [avFactory playerWithPlayerItem:item];
   _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
   // This is to fix 2 bugs: 1. blank video for encrypted video streams on iOS 16
@@ -339,7 +311,14 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   _playerLayer = [AVPlayerLayer playerLayerWithPlayer:_player];
   [self.flutterViewLayer addSublayer:_playerLayer];
 
-  [self createVideoOutputAndDisplayLink:frameUpdater];
+  // Configure output.
+  _displayLink = displayLink;
+  NSDictionary *pixBuffAttributes = @{
+    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{}
+  };
+  _videoOutput = [avFactory videoOutputWithPixelBufferAttributes:pixBuffAttributes];
+  frameUpdater.videoOutput = _videoOutput;
 
   [self addObserversForItem:item player:_player];
 
@@ -422,23 +401,9 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   } else {
     [_player pause];
   }
-#if TARGET_OS_OSX
-  if (_displayLink) {
-    if (_isPlaying) {
-      NSScreen *screen = self.registrar.view.window.screen;
-      if (screen) {
-        CGDirectDisplayID viewDisplayID =
-            (CGDirectDisplayID)[screen.deviceDescription[@"NSScreenNumber"] unsignedIntegerValue];
-        CVDisplayLinkSetCurrentCGDisplay(_displayLink, viewDisplayID);
-      }
-      CVDisplayLinkStart(_displayLink);
-    } else {
-      CVDisplayLinkStop(_displayLink);
-    }
-  }
-#else
-  _displayLink.paused = !_isPlaying;
-#endif
+  // If the texture is still waiting for an expected frame, the display link needs to keep
+  // running until it arrives regardless of the play/pause state.
+  _displayLink.running = _isPlaying || self.waitingForFrame;
 }
 
 - (void)setupEventSinkIfReadyToPlay {
@@ -512,17 +477,37 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   return FVPCMTimeToMillis([[[_player currentItem] asset] duration]);
 }
 
-- (void)seekTo:(int)location completionHandler:(void (^)(BOOL))completionHandler {
-  CMTime locationCMT = CMTimeMake(location, 1000);
+- (void)seekTo:(int64_t)location completionHandler:(void (^)(BOOL))completionHandler {
+  CMTime previousCMTime = _player.currentTime;
+  CMTime targetCMTime = CMTimeMake(location, 1000);
   CMTimeValue duration = _player.currentItem.asset.duration.value;
   // Without adding tolerance when seeking to duration,
   // seekToTime will never complete, and this call will hang.
   // see issue https://github.com/flutter/flutter/issues/124475.
   CMTime tolerance = location == duration ? CMTimeMake(1, 1000) : kCMTimeZero;
-  [_player seekToTime:locationCMT
+  [_player seekToTime:targetCMTime
         toleranceBefore:tolerance
          toleranceAfter:tolerance
-      completionHandler:completionHandler];
+      completionHandler:^(BOOL completed) {
+        if (CMTimeCompare(self.player.currentTime, previousCMTime) != 0) {
+          // Ensure that a frame is drawn once available, even if currently paused. In theory a race
+          // is possible here where the new frame has already drawn by the time this code runs, and
+          // the display link stays on indefinitely, but that should be relatively harmless. This
+          // must use the display link rather than just informing the engine that a new frame is
+          // available because the seek completing doesn't guarantee that the pixel buffer is
+          // already available.
+          [self expectFrame];
+        }
+
+        if (completionHandler) {
+          completionHandler(completed);
+        }
+      }];
+}
+
+- (void)expectFrame {
+  self.waitingForFrame = YES;
+  self.displayLink.running = YES;
 }
 
 - (void)setIsLooping:(BOOL)isLooping {
@@ -558,12 +543,29 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 }
 
 - (CVPixelBufferRef)copyPixelBuffer {
+  CVPixelBufferRef buffer = NULL;
   CMTime outputItemTime = [_videoOutput itemTimeForHostTime:CACurrentMediaTime()];
   if ([_videoOutput hasNewPixelBufferForItemTime:outputItemTime]) {
-    return [_videoOutput copyPixelBufferForItemTime:outputItemTime itemTimeForDisplay:NULL];
+    buffer = [_videoOutput copyPixelBufferForItemTime:outputItemTime itemTimeForDisplay:NULL];
   } else {
-    return NULL;
+    // If the current time isn't available yet, use the time that was checked when informing the
+    // engine that a frame was available (if any).
+    CMTime lastAvailableTime = self.frameUpdater.lastKnownAvailableTime;
+    if (CMTIME_IS_VALID(lastAvailableTime)) {
+      buffer = [_videoOutput copyPixelBufferForItemTime:lastAvailableTime itemTimeForDisplay:NULL];
+    }
   }
+
+  if (self.waitingForFrame && buffer) {
+    self.waitingForFrame = NO;
+    // If the display link was only running temporarily to pick up a new frame while the video was
+    // paused, stop it again.
+    if (!self.isPlaying) {
+      self.displayLink.running = NO;
+    }
+  }
+
+  return buffer;
 }
 
 - (void)onTextureUnregistered:(NSObject<FlutterTexture> *)texture {
@@ -603,16 +605,7 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 
   _disposed = YES;
   [_playerLayer removeFromSuperlayer];
-#if TARGET_OS_OSX
-  if (_displayLink) {
-    CVDisplayLinkStop(_displayLink);
-    CVDisplayLinkRelease(_displayLink);
-    _displayLink = NULL;
-  }
-  dispatch_source_cancel(_displayLinkSource);
-#else
-  [_displayLink invalidate];
-#endif
+  _displayLink = nil;
   [self removeKeyValueObservers];
 
   [self.player replaceCurrentItemWithPlayerItem:nil];
@@ -653,38 +646,37 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 
 @end
 
-@interface FVPVideoPlayerPlugin () <FVPAVFoundationVideoPlayerApi>
+@interface FVPVideoPlayerPlugin ()
 @property(readonly, weak, nonatomic) NSObject<FlutterTextureRegistry> *registry;
 @property(readonly, weak, nonatomic) NSObject<FlutterBinaryMessenger> *messenger;
-@property(readonly, strong, nonatomic)
-    NSMutableDictionary<NSNumber *, FVPVideoPlayer *> *playersByTextureId;
 @property(readonly, strong, nonatomic) NSObject<FlutterPluginRegistrar> *registrar;
-@property(nonatomic, strong) id<FVPPlayerFactory> playerFactory;
+@property(nonatomic, strong) id<FVPDisplayLinkFactory> displayLinkFactory;
+@property(nonatomic, strong) id<FVPAVFactory> avFactory;
 @end
 
 @implementation FVPVideoPlayerPlugin
 + (void)registerWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   FVPVideoPlayerPlugin *instance = [[FVPVideoPlayerPlugin alloc] initWithRegistrar:registrar];
-#if !TARGET_OS_OSX
-  // TODO(stuartmorgan): Remove the ifdef once >3.13 reaches stable. See
-  // https://github.com/flutter/flutter/issues/135320
   [registrar publish:instance];
-#endif
-  FVPAVFoundationVideoPlayerApiSetup(registrar.messenger, instance);
+  SetUpFVPAVFoundationVideoPlayerApi(registrar.messenger, instance);
 }
 
 - (instancetype)initWithRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
-  return [self initWithPlayerFactory:[[FVPDefaultPlayerFactory alloc] init] registrar:registrar];
+  return [self initWithAVFactory:[[FVPDefaultAVFactory alloc] init]
+              displayLinkFactory:[[FVPDefaultDisplayLinkFactory alloc] init]
+                       registrar:registrar];
 }
 
-- (instancetype)initWithPlayerFactory:(id<FVPPlayerFactory>)playerFactory
-                            registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
+- (instancetype)initWithAVFactory:(id<FVPAVFactory>)avFactory
+               displayLinkFactory:(id<FVPDisplayLinkFactory>)displayLinkFactory
+                        registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   self = [super init];
   NSAssert(self, @"super init cannot be nil");
   _registry = [registrar textures];
   _messenger = [registrar messenger];
   _registrar = registrar;
-  _playerFactory = playerFactory;
+  _displayLinkFactory = displayLinkFactory ?: [[FVPDefaultDisplayLinkFactory alloc] init];
+  _avFactory = avFactory ?: [[FVPDefaultAVFactory alloc] init];
   _playersByTextureId = [NSMutableDictionary dictionaryWithCapacity:1];
   return self;
 }
@@ -692,14 +684,10 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
 - (void)detachFromEngineForRegistrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   [self.playersByTextureId.allValues makeObjectsPerformSelector:@selector(disposeSansEventChannel)];
   [self.playersByTextureId removeAllObjects];
-  // TODO(57151): This should be commented out when 57151's fix lands on stable.
-  // This is the correct behavior we never did it in the past and the engine
-  // doesn't currently support it.
-  // FVPAVFoundationVideoPlayerApiSetup(registrar.messenger, nil);
+  SetUpFVPAVFoundationVideoPlayerApi(registrar.messenger, nil);
 }
 
-- (FVPTextureMessage *)onPlayerSetup:(FVPVideoPlayer *)player
-                        frameUpdater:(FVPFrameUpdater *)frameUpdater {
+- (int64_t)onPlayerSetup:(FVPVideoPlayer *)player frameUpdater:(FVPFrameUpdater *)frameUpdater {
   int64_t textureId = [self.registry registerTexture:player];
   frameUpdater.textureId = textureId;
   FlutterEventChannel *eventChannel = [FlutterEventChannel
@@ -709,8 +697,12 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   [eventChannel setStreamHandler:player];
   player.eventChannel = eventChannel;
   self.playersByTextureId[@(textureId)] = player;
-  FVPTextureMessage *result = [FVPTextureMessage makeWithTextureId:@(textureId)];
-  return result;
+
+  // Ensure that the first frame is drawn once available, even if the video isn't played, since
+  // the engine is now expecting the texture to be populated.
+  [player expectFrame];
+
+  return textureId;
 }
 
 - (void)initialize:(FlutterError *__autoreleasing *)error {
@@ -727,111 +719,106 @@ NS_INLINE CGFloat radiansToDegrees(CGFloat radians) {
   [self.playersByTextureId removeAllObjects];
 }
 
-- (FVPTextureMessage *)create:(FVPCreateMessage *)input error:(FlutterError **)error {
+- (nullable NSNumber *)createWithOptions:(nonnull FVPCreationOptions *)options
+                                   error:(FlutterError **)error {
   FVPFrameUpdater *frameUpdater = [[FVPFrameUpdater alloc] initWithRegistry:_registry];
+  FVPDisplayLink *displayLink =
+      [self.displayLinkFactory displayLinkWithRegistrar:_registrar
+                                               callback:^() {
+                                                 [frameUpdater displayLinkFired];
+                                               }];
+
   FVPVideoPlayer *player;
-  if (input.asset) {
+  if (options.asset) {
     NSString *assetPath;
-    if (input.packageName) {
-      assetPath = [_registrar lookupKeyForAsset:input.asset fromPackage:input.packageName];
+    if (options.packageName) {
+      assetPath = [_registrar lookupKeyForAsset:options.asset fromPackage:options.packageName];
     } else {
-      assetPath = [_registrar lookupKeyForAsset:input.asset];
+      assetPath = [_registrar lookupKeyForAsset:options.asset];
     }
     @try {
       player = [[FVPVideoPlayer alloc] initWithAsset:assetPath
                                         frameUpdater:frameUpdater
-                                       playerFactory:_playerFactory
+                                         displayLink:displayLink
+                                           avFactory:_avFactory
                                            registrar:self.registrar];
-      return [self onPlayerSetup:player frameUpdater:frameUpdater];
+      return @([self onPlayerSetup:player frameUpdater:frameUpdater]);
     } @catch (NSException *exception) {
       *error = [FlutterError errorWithCode:@"video_player" message:exception.reason details:nil];
       return nil;
     }
-  } else if (input.uri) {
-    player = [[FVPVideoPlayer alloc] initWithURL:[NSURL URLWithString:input.uri]
+  } else if (options.uri) {
+    player = [[FVPVideoPlayer alloc] initWithURL:[NSURL URLWithString:options.uri]
                                     frameUpdater:frameUpdater
-                                     httpHeaders:input.httpHeaders
-                                   playerFactory:_playerFactory
+                                     displayLink:displayLink
+                                     httpHeaders:options.httpHeaders
+                                       avFactory:_avFactory
                                        registrar:self.registrar];
-    return [self onPlayerSetup:player frameUpdater:frameUpdater];
+    return @([self onPlayerSetup:player frameUpdater:frameUpdater]);
   } else {
     *error = [FlutterError errorWithCode:@"video_player" message:@"not implemented" details:nil];
     return nil;
   }
 }
 
-- (void)dispose:(FVPTextureMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  [self.registry unregisterTexture:input.textureId.intValue];
-  [self.playersByTextureId removeObjectForKey:input.textureId];
-  // If the Flutter contains https://github.com/flutter/engine/pull/12695,
-  // the `player` is disposed via `onTextureUnregistered` at the right time.
-  // Without https://github.com/flutter/engine/pull/12695, there is no guarantee that the
-  // texture has completed the un-reregistration. It may leads a crash if we dispose the
-  // `player` before the texture is unregistered. We add a dispatch_after hack to make sure the
-  // texture is unregistered before we dispose the `player`.
-  //
-  // TODO(cyanglaz): Remove this dispatch block when
-  // https://github.com/flutter/flutter/commit/8159a9906095efc9af8b223f5e232cb63542ad0b is in
-  // stable And update the min flutter version of the plugin to the stable version.
-  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                 dispatch_get_main_queue(), ^{
-                   if (!player.disposed) {
-                     [player dispose];
-                   }
-                 });
+- (void)disposePlayer:(NSInteger)textureId error:(FlutterError **)error {
+  NSNumber *playerKey = @(textureId);
+  FVPVideoPlayer *player = self.playersByTextureId[playerKey];
+  [self.registry unregisterTexture:textureId];
+  [self.playersByTextureId removeObjectForKey:playerKey];
+  if (!player.disposed) {
+    [player dispose];
+  }
 }
 
-- (void)setLooping:(FVPLoopingMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  player.isLooping = input.isLooping.boolValue;
+- (void)setLooping:(BOOL)isLooping forPlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
+  player.isLooping = isLooping;
 }
 
-- (void)setVolume:(FVPVolumeMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  [player setVolume:input.volume.doubleValue];
+- (void)setVolume:(double)volume forPlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
+  [player setVolume:volume];
 }
 
-- (void)setPlaybackSpeed:(FVPPlaybackSpeedMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  [player setPlaybackSpeed:input.speed.doubleValue];
+- (void)setPlaybackSpeed:(double)speed forPlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
+  [player setPlaybackSpeed:speed];
 }
 
-- (void)play:(FVPTextureMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
+- (void)playPlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
   [player play];
 }
 
-- (FVPPositionMessage *)position:(FVPTextureMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  FVPPositionMessage *result = [FVPPositionMessage makeWithTextureId:input.textureId
-                                                            position:@([player position])];
-  return result;
+- (nullable NSNumber *)positionForPlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
+  return @([player position]);
 }
 
-- (void)seekTo:(FVPPositionMessage *)input
-    completion:(void (^)(FlutterError *_Nullable))completion {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
-  [player seekTo:input.position.intValue
+- (void)seekTo:(NSInteger)position
+     forPlayer:(NSInteger)textureId
+    completion:(nonnull void (^)(FlutterError *_Nullable))completion {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
+  [player seekTo:position
       completionHandler:^(BOOL finished) {
         dispatch_async(dispatch_get_main_queue(), ^{
-          [self.registry textureFrameAvailable:input.textureId.intValue];
           completion(nil);
         });
       }];
 }
 
-- (void)pause:(FVPTextureMessage *)input error:(FlutterError **)error {
-  FVPVideoPlayer *player = self.playersByTextureId[input.textureId];
+- (void)pausePlayer:(NSInteger)textureId error:(FlutterError **)error {
+  FVPVideoPlayer *player = self.playersByTextureId[@(textureId)];
   [player pause];
 }
 
-- (void)setMixWithOthers:(FVPMixWithOthersMessage *)input
+- (void)setMixWithOthers:(BOOL)mixWithOthers
                    error:(FlutterError *_Nullable __autoreleasing *)error {
 #if TARGET_OS_OSX
   // AVAudioSession doesn't exist on macOS, and audio always mixes, so just no-op.
 #else
-  if (input.mixWithOthers.boolValue) {
+  if (mixWithOthers) {
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback
                                      withOptions:AVAudioSessionCategoryOptionMixWithOthers
                                            error:nil];
