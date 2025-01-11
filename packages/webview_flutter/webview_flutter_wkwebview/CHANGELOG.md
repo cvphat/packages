@@ -1,3 +1,82 @@
+## 3.17.0
+
+* Adds a change listener for the `canGoBack` property. See
+  `WebKitWebViewController.setOnCanGoBackChange`.
+* Updates minimum supported SDK version to Flutter 3.22/Dart 3.4.
+
+## 3.16.3
+
+* Fixes re-registering existing channels while removing Javascript channels.
+
+## 3.16.2
+
+* Updates README to remove contributor-focused documentation.
+
+## 3.16.1
+
+* Adds `missing_code_block_language_in_doc_comment` lint.
+
+## 3.16.0
+
+* Supports NTLM for authentication.
+
+## 3.15.0
+
+* Adds macOS support.
+
+## 3.14.0
+
+* Adds Swift Package Manager compatibility.
+
+## 3.13.1
+
+* Fixes `JSON.stringify()` cannot serialize cyclic structures.
+
+## 3.13.0
+
+* Adds `decidePolicyForNavigationResponse` to internal WKNavigationDelegate to support the
+  `PlatformNavigationDelegate.onHttpError` callback.
+
+## 3.12.0
+
+* Adds support for `setOnScrollPositionChange` method to the `WebKitWebViewController`.
+
+## 3.11.0
+
+* Adds support to show JavaScript dialog. See `PlatformWebViewController.setOnJavaScriptAlertDialog`, `PlatformWebViewController.setOnJavaScriptConfirmDialog` and `PlatformWebViewController.setOnJavaScriptTextInputDialog`.
+
+## 3.10.3
+
+* Adds a check that throws an `ArgumentError` when `WebKitWebViewController.addJavaScriptChannel`
+  receives a `JavaScriptChannelParams` with a name that is not unique.
+* Updates minimum iOS version to 12.0 and minimum Flutter version to 3.16.6.
+
+## 3.10.2
+
+* Adds privacy manifest.
+
+## 3.10.1
+
+* Fixes new lint warnings.
+
+## 3.10.0
+
+* Adds support for `PlatformNavigationDelegate.setOnHttpAuthRequest`.
+* Updates minimum supported SDK version to Flutter 3.10/Dart 3.0.
+
+## 3.9.4
+
+* Updates to Pigeon 13.
+
+## 3.9.3
+
+* Fixes `use_build_context_synchronously` lint violations in the example app.
+
+## 3.9.2
+
+* Fixes error caused by calling `WKWebViewConfiguration.limitsNavigationsToAppBoundDomains` on
+  versions below 14.
+
 ## 3.9.1
 
 * Fixes bug where `WebkitWebViewController.getUserAgent` was incorrectly returning an empty String.
@@ -35,7 +114,7 @@
 
 * Introduces `NSError.toString` for better diagnostics.
 
-## 3.6.2 
+## 3.6.2
 
 * Fixes unawaited_futures violations.
 
